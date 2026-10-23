@@ -1,3 +1,8 @@
+
+mod conn_met;
+
+use conn_met::{ConnState, ConnectionMetrics};
+
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
@@ -11,68 +16,30 @@ use std::{
     },
 };
 
-#[derive(Debug)]
-enum ConnState {
-    Established,
-    Connecting,
-    Closed,
-}
-
-// ConnectionMetrics contains client connections informations.
-struct ConnectionMetrics {
-    addr: SocketAddr,
-    state: ConnState,
-    // state: std::sync::Mutex<ConnState>,
-    // bytes sent by client to server
-    bytes_received: AtomicUsize,
-    // bytes sent by server to client
-    bytes_sent: AtomicUsize,
-    conn_time: std::time::Instant,
-}
-
-impl ConnectionMetrics {
-    fn new(addr: SocketAddr) -> Self {
-        Self {
-            addr,
-            // state: std::sync::Mutex::new(ConnState::Connecting),
-            state: ConnState::Connecting,
-            bytes_received: AtomicUsize::new(0),
-            bytes_sent: AtomicUsize::new(0),
-            conn_time: std::time::Instant::now(),
-        }
-    }
-
-    fn set_conn_state(&mut self, state: ConnState) {
-        self.state = state;
-    }
-
-    // fn set_conn_state(&self, state: ConnState) {
-    //     *self.state.lock().unwrap() = state;
-    // }
-
-    // fn up_bytes() {
-    //
-    // }
-    //
-    // fn down_bytes() {
-    //
-    // }
-
-    // fn get_conn_state(&self) -> &ConnState {
-    //     &self.state
-    // }
-}
-
-async fn process(mut client: TcpStream, addr: &'static str, conn: mut ConnectionMetrics/*, conn: Arc<ConnectionMetrics>*/) {
+async fn process(mut client: TcpStream, addr: &'static str, mut conn: ConnectionMetrics) {
     // Disable Nagle's algorithm
-    client.set_nodelay(true).unwrap();
+    if let Err(e) = client.set_nodelay(true) {
+        eprintln!("Failed to set client TCP_NODELAY: {e}");
+        return;
+    }
 
     // Connect to the server, stream is for forwarding the data
     // from server to client.
-    let mut stream = TcpStream::connect(addr).await.unwrap();
+    let mut stream = match TcpStream::connect(addr).await {
+        Ok(stream) => stream,
+        Err(e) => {
+            eprintln!("Failed to connect to upstream server: {e}");
+            conn.set_conn_state(ConnState::Closed);
+            return;
+        }
+    };
 
     // Disable Nagle's algorithm
-    stream.set_nodelay(true).unwrap();
+    if let Err(e) = stream.set_nodelay(true) {
+        eprintln!("Failed to set upstream TCP_NODELAY: {e}");
+        conn.set_conn_state(ConnState::Closed);
+        return;
+    }
 
     conn.set_conn_state(ConnState::Established);
 
@@ -84,26 +51,49 @@ async fn process(mut client: TcpStream, addr: &'static str, conn: mut Connection
     loop {
         tokio::select! {
             // upstream read from client write to server
-            n = client.read(&mut up) => {
-                let n = n.unwrap();
+            result = client.read(&mut up) => {
+                let n = match result {
+                    Ok(n) => n,
+                    Err(e) => {
+                        eprintln!("Client read error: {e}");
+                        break;
+                    }
+                };
+
                 if n == 0 {
                     conn.set_conn_state(ConnState::Closed);
                     break;
                 }
+
                 conn.bytes_received.fetch_add(n, Ordering::Relaxed);
-                stream.write_all(&up[..n]).await.unwrap();
+
+                if let Err(e) = stream.write_all(&up[..n]).await {
+                    eprintln!("Upstream write error: {e}");
+                    break;
+                }
             }
 
             // downstream read from server write to client
-            n = stream.read(&mut down) => {
-                let n = n.unwrap();
+            result = stream.read(&mut down) => {
+                let n = match result {
+                    Ok(n) => n,
+                    Err(e) => {
+                        eprintln!("Upstream read error: {e}");
+                        break;
+                    }
+                };
+
                 if n == 0 {
                     break;
                 }
-                conn.bytes_sent.fetch_add(n, Ordering::Relaxed);
-                client.write_all(&down[..n]).await.unwrap();
-            }
 
+                conn.bytes_sent.fetch_add(n, Ordering::Relaxed);
+
+                if let Err(e) = client.write_all(&down[..n]).await {
+                    eprintln!("Client write error: {e}");
+                    break;
+                }
+            }
         }
     }
 
@@ -124,13 +114,14 @@ async fn main() -> std::io::Result<()> {
         let (socket, addr) = listener.accept().await?;
 
         // let conn = Arc::new(ConnectionMetrics::new(addr));
-        let mut conn = ConnectionMetrics::new(addr);
+        let conn = ConnectionMetrics::new(addr);
         // conn_list.lock().await.push(Arc::clone(&conn));
 
         // A new task is spawned for each inbound socket.
         // The socket is moved to the new task and processed there.
         tokio::spawn(async move {
-            process(socket, c_addr, mut conn/*, Arc::clone(&conn)*/).await;
+            process(socket, c_addr, conn).await;
         });
     }
 }
+
